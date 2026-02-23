@@ -7,3 +7,4 @@ preprocess/*.csv
 result/*.csv
 result/graph/*.csv
 result/graph/**/*.csv
+result/plots/*.png
