@@ -4,3 +4,5 @@ flavordb.csv
 molecules.csv
 vocab.csv
 preprocess/*.csv
+result/*.csv
+result/graph/*.csv
