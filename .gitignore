@@ -1,2 +1,6 @@
 # Large datasets
 recipes.csv
+flavordb.csv
+molecules.csv
+vocab.csv
+preprocess/*.csv
