@@ -17,6 +17,7 @@ Fallback input:
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import math
 import pickle
@@ -58,6 +59,41 @@ def _pick_col(df: pd.DataFrame, cands: Sequence[str]) -> str | None:
         if c in df.columns:
             return c
     return None
+
+
+def _parse_ingredient_cell(cell) -> list[str]:
+    if cell is None or pd.isna(cell):
+        return []
+
+    if isinstance(cell, (list, tuple, set)):
+        return [str(x).strip() for x in cell if str(x).strip()]
+
+    sval = str(cell).strip()
+    if not sval or sval.lower() == "nan":
+        return []
+
+    if (sval.startswith("[") and sval.endswith("]")) or (sval.startswith("{") and sval.endswith("}")):
+        try:
+            parsed = ast.literal_eval(sval)
+            if isinstance(parsed, (list, tuple, set)):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+
+        inner = sval[1:-1]
+        toks = [t.strip().strip("'\"") for t in inner.split(",")]
+        toks = [t for t in toks if t]
+        if toks:
+            return toks
+
+    for sep in ["|", ";", ","]:
+        if sep in sval:
+            toks = [t.strip() for t in sval.split(sep)]
+            toks = [t for t in toks if t]
+            if len(toks) > 1:
+                return toks
+
+    return [sval]
 
 
 def load_molecule_names() -> Dict[int, str]:
@@ -102,7 +138,8 @@ def load_saved_state() -> tuple[dict, dict, dict]:
         for rid, ing in recipes_long[[rid_col, ing_col]].itertuples(index=False):
             if pd.isna(rid) or pd.isna(ing):
                 continue
-            rid2ings[int(rid)].add(str(ing))
+            for val in _parse_ingredient_cell(ing):
+                rid2ings[int(rid)].add(val)
 
     return p_by_r, rid2cuisine, rid2ings
 
@@ -118,14 +155,17 @@ def _extract_rid2ings_from_df(df: pd.DataFrame) -> dict[int, set[str]]:
             "ingredient_name_en",
             "ing",
             "ingredient_clean",
+            "ingredient_list",
+            "ingredients_list",
+            "ingredients_en",
         ],
     )
     rid2ings: dict[int, set[str]] = defaultdict(set)
     if rid_col is None or ing_col is None:
         return rid2ings
+
     for rid, ing in df[[rid_col, ing_col]].dropna().itertuples(index=False):
-        sval = str(ing).strip()
-        if sval:
+        for sval in _parse_ingredient_cell(ing):
             rid2ings[int(rid)].add(sval)
     return rid2ings
 
