@@ -48,10 +48,55 @@ DATA_DIR = REPO_ROOT / "data"
 GRAPH_ROOT = REPO_ROOT / "result" / "graph"
 PLOTS_ROOT = REPO_ROOT / "result" / "plots"
 ANALYSIS_ROOT = REPO_ROOT / "result" / "analysis"
+RECIPES_LONG_NORMALIZED_CSV = REPO_ROOT / "result" / "recipes_long_normalized.csv"
 
 
 def safe_key(name: str) -> str:
     return "_".join(str(name).strip().split()) or "unknown"
+
+
+def _safe_key_regex(name: str) -> str:
+    return re.sub(r"\W+", "_", str(name)).strip("_") or "unknown"
+
+
+def _resolve_graph_csv_path(cuisine: str) -> Path:
+    candidates = [
+        GRAPH_ROOT / str(cuisine) / "000_recipe_molecule_edges.csv",
+        GRAPH_ROOT / safe_key(cuisine) / "000_recipe_molecule_edges.csv",
+        GRAPH_ROOT / _safe_key_regex(cuisine) / "000_recipe_molecule_edges.csv",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0]
+
+
+def list_graph_cuisines() -> list[str]:
+    if not GRAPH_ROOT.exists():
+        return []
+    out: list[str] = []
+    for d in sorted(p for p in GRAPH_ROOT.iterdir() if p.is_dir()):
+        if (d / "000_recipe_molecule_edges.csv").exists():
+            out.append(d.name)
+    return out
+
+
+def list_cuisines_from_normalized_csv() -> list[str]:
+    csv_path = RECIPES_LONG_NORMALIZED_CSV
+    if not csv_path.exists():
+        return []
+    try:
+        cols = pd.read_csv(csv_path, nrows=1).columns.tolist()
+    except Exception:
+        return []
+    c_col = next((c for c in ["cuisine", "cuisine_name", "region"] if c in cols), None)
+    if c_col is None:
+        return []
+    try:
+        vals = pd.read_csv(csv_path, usecols=[c_col])[c_col].dropna().astype(str)
+    except Exception:
+        return []
+    return sorted(set(v for v in vals if v))
 
 
 def _pick_col(df: pd.DataFrame, cands: Sequence[str]) -> str | None:
@@ -118,6 +163,28 @@ def load_molecule_names() -> Dict[int, str]:
     return dict(zip(mol_meta["mol_id"].astype(int), mol_meta["mol_name"].astype(str)))
 
 
+def load_molecule_flavor_profiles() -> Dict[int, str]:
+    candidates = [
+        DATA_DIR / "molecules.csv",
+        REPO_ROOT / "molecules.csv",
+    ]
+    csv_path = next((p for p in candidates if p.exists()), None)
+    if csv_path is None:
+        return {}
+    mols = pd.read_csv(csv_path)
+    col_id = _pick_col(mols, ["pubchem id", "pubchem_id", "PubChem ID", "id", "molecule_id"])
+    col_flavor = _pick_col(mols, ["flavor profile", "flavor_profile", "flavor", "flavor notes"])
+    if col_id is None or col_flavor is None:
+        return {}
+    mol_meta = (
+        mols[[col_id, col_flavor]]
+        .dropna()
+        .drop_duplicates(subset=[col_id])
+        .rename(columns={col_id: "mol_id", col_flavor: "flavor_profile"})
+    )
+    return dict(zip(mol_meta["mol_id"].astype(int), mol_meta["flavor_profile"].astype(str)))
+
+
 def load_saved_state() -> tuple[dict, dict, dict]:
     p_path = SAVE_DIR / "p_by_r.pkl"
     c_path = SAVE_DIR / "rid2cuisine.pkl"
@@ -171,7 +238,7 @@ def _extract_rid2ings_from_df(df: pd.DataFrame) -> dict[int, set[str]]:
 
 
 def load_from_graph_csv(cuisine: str) -> tuple[dict, list[int], dict[int, set[str]]]:
-    csv_path = GRAPH_ROOT / cuisine / "000_recipe_molecule_edges.csv"
+    csv_path = _resolve_graph_csv_path(cuisine)
     if not csv_path.exists():
         return {}, [], {}
     df = pd.read_csv(csv_path)
@@ -185,9 +252,62 @@ def load_from_graph_csv(cuisine: str) -> tuple[dict, list[int], dict[int, set[st
     return p_by_r, sorted(p_by_r.keys()), rid2ings
 
 
+def load_rid2ings_from_normalized_csv(cuisine: str | None = None, restrict_rids: set[int] | None = None) -> dict[int, set[str]]:
+    """Load recipe->ingredients from normalized long CSV as fallback/supplement."""
+    csv_path = RECIPES_LONG_NORMALIZED_CSV
+    if not csv_path.exists():
+        return {}
+
+    rid2ings: dict[int, set[str]] = defaultdict(set)
+    rid_col = None
+    ing_col = None
+    cuisine_col = None
+
+    try:
+        chunks = pd.read_csv(csv_path, chunksize=200000)
+    except Exception:
+        return {}
+
+    for chunk in chunks:
+        if rid_col is None:
+            rid_col = _pick_col(chunk, ["recipe_id", "rid", "recipeid"])
+            ing_col = _pick_col(
+                chunk,
+                [
+                    "ingredient",
+                    "ingredients",
+                    "ingredient_name",
+                    "ingredient_name_en",
+                    "ing",
+                    "ingredient_clean",
+                    "ingredient_list",
+                    "ingredients_list",
+                    "ingredients_en",
+                ],
+            )
+            cuisine_col = _pick_col(chunk, ["cuisine", "cuisine_name", "region"])
+            if rid_col is None or ing_col is None:
+                return {}
+
+        view = chunk
+        if cuisine is not None and cuisine_col in chunk.columns:
+            view = view[view[cuisine_col].astype(str) == str(cuisine)]
+        if restrict_rids is not None:
+            view = view[view[rid_col].isin(restrict_rids)]
+
+        for rid, ing in view[[rid_col, ing_col]].dropna().itertuples(index=False):
+            try:
+                rid_int = int(rid)
+            except Exception:
+                continue
+            for sval in _parse_ingredient_cell(ing):
+                rid2ings[rid_int].add(sval)
+    return rid2ings
+
+
 def enrich_molecule_names_from_edges(mol_id_to_name: Dict[int, str], cuisine: str) -> Dict[int, str]:
     """Fill missing molecule names from cuisine graph csv columns when available."""
-    csv_path = GRAPH_ROOT / cuisine / "000_recipe_molecule_edges.csv"
+    csv_path = _resolve_graph_csv_path(cuisine)
     if not csv_path.exists():
         return mol_id_to_name
     try:
@@ -212,6 +332,35 @@ def enrich_molecule_names_from_edges(mol_id_to_name: Dict[int, str], cuisine: st
     if updates:
         print(f"[{cuisine}] molecule names enriched from graph CSV: +{updates}")
     return mol_id_to_name
+
+
+def enrich_molecule_flavor_from_edges(mol_id_to_flavor: Dict[int, str], cuisine: str) -> Dict[int, str]:
+    """Fill missing flavor profiles from cuisine graph CSV columns when available."""
+    csv_path = _resolve_graph_csv_path(cuisine)
+    if not csv_path.exists():
+        return mol_id_to_flavor
+    try:
+        df = pd.read_csv(csv_path, nrows=50000)
+    except Exception:
+        return mol_id_to_flavor
+
+    mol_col = _pick_col(df, ["molecule", "molecule_id", "mol_id"])
+    flavor_col = _pick_col(df, ["flavor_profile", "flavor profile", "flavor"])
+    if mol_col is None or flavor_col is None:
+        return mol_id_to_flavor
+
+    updates = 0
+    for m, flavor in df[[mol_col, flavor_col]].dropna().itertuples(index=False):
+        mid = int(m)
+        sval = str(flavor).strip()
+        if not sval or sval.lower() == "nan":
+            continue
+        if mid not in mol_id_to_flavor:
+            mol_id_to_flavor[mid] = sval
+            updates += 1
+    if updates:
+        print(f"[{cuisine}] molecule flavor enriched from graph CSV: +{updates}")
+    return mol_id_to_flavor
 
 
 def mass_cut_molecules(dist: dict, rho: float, max_keep: int | None) -> list[int]:
@@ -421,45 +570,81 @@ def _parse_flavor_tokens(s: str) -> list[str]:
     return [t for t in toks if t]
 
 
-def _community_keywords(cluster_nodes: list[int], mol_id_to_name: dict[int, str], top_n: int = 5) -> str:
-    ban = {
-        "acid", "methyl", "ethyl", "propyl", "isopropyl", "d", "l", "dl", "cis", "trans",
-        "alpha", "beta", "gamma", "oxide", "one", "ol", "ene", "ate", "yl", "di", "tri",
-    }
-    cnt: Counter = Counter()
-    for m in cluster_nodes:
-        name = mol_id_to_name.get(int(m), "")
-        if not name:
-            continue
-        toks = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z\-]{2,}", name)]
-        cnt.update(t for t in toks if t not in ban)
-    return ", ".join([w for w, _ in cnt.most_common(top_n)])
+def _community_top_molecules(g: nx.Graph, cluster_nodes: list[int], mol_id_to_name: dict[int, str], top_n: int = 3) -> str:
+    """Return top central molecule names in a community (by weighted degree)."""
+    if not cluster_nodes:
+        return ""
+    sub = g.subgraph(cluster_nodes)
+    ranked = sorted(sub.nodes(), key=lambda n: sub.degree(n, weight="weight"), reverse=True)[:top_n]
+    names = [mol_id_to_name.get(int(n), str(int(n))) for n in ranked]
+    return ", ".join(names)
 
 
-def save_moleculespace_html(cuisine: str, g: nx.Graph, part: dict[int, int], mol_id_to_name: dict[int, str], out_html: Path) -> None:
+def save_moleculespace_html(
+    cuisine: str,
+    g: nx.Graph,
+    part: dict[int, int],
+    mol_id_to_name: dict[int, str],
+    mol_id_to_flavor: dict[int, str],
+    out_html: Path,
+    cluster_lifts: dict[int, list[tuple[str, float, float, float, int]]] | None = None,
+) -> None:
     """Interactive molecule-space HTML similar to vocab_alignment notebook style."""
     if Network is None or g.number_of_nodes() == 0:
         return
 
-    wdeg = dict(g.degree(weight="weight"))
-    top_nodes = set(sorted(g.nodes(), key=lambda n: wdeg.get(n, 0.0), reverse=True)[:50])
-    deg_vals = np.array([max(wdeg.get(n, 0.0), 1e-12) for n in g.nodes()])
-    size_map = {n: 4 + 7 * math.log1p(v) for n, v in zip(g.nodes(), deg_vals)}
+    # HTML view pruning for faster rendering.
+    max_nodes_html = 1000
+    top_edges_per_node_html = 20
+    base_wdeg = dict(g.degree(weight="weight"))
+    keep_nodes = set(sorted(g.nodes(), key=lambda n: base_wdeg.get(n, 0.0), reverse=True)[:max_nodes_html])
+    h = g.subgraph(keep_nodes).copy()
+    kept_edges = set()
+    for src in h.nodes():
+        nbrs = sorted(h[src].items(), key=lambda kv: float(kv[1].get("weight", 0.0)), reverse=True)
+        for dst, attrs in nbrs[:top_edges_per_node_html]:
+            a, b = (src, dst) if src < dst else (dst, src)
+            kept_edges.add((a, b, float(attrs.get("weight", 0.0))))
+    h2 = nx.Graph()
+    for n in h.nodes():
+        h2.add_node(n)
+    for a, b, w in kept_edges:
+        h2.add_edge(a, b, weight=w)
+    h2.remove_nodes_from(list(nx.isolates(h2)))
+    if h2.number_of_nodes() == 0:
+        return
+
+    wdeg = dict(h2.degree(weight="weight"))
+    top_nodes = set(sorted(h2.nodes(), key=lambda n: wdeg.get(n, 0.0), reverse=True)[:50])
+    # Stronger node-size contrast so hubs are clearly distinguishable.
+    deg_vals = np.array([max(wdeg.get(n, 0.0), 1e-12) for n in h2.nodes()], dtype=float)
+    d_min = float(np.min(deg_vals)) if len(deg_vals) else 0.0
+    d_max = float(np.max(deg_vals)) if len(deg_vals) else 1.0
+    size_map = {}
+    for n in h2.nodes():
+        d = max(wdeg.get(n, 0.0), 0.0)
+        z = (d - d_min) / (d_max - d_min + 1e-12)
+        size_map[n] = 5.0 + 23.0 * (z ** 0.65)
     palette = [
         "#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#B07AA1", "#9C755F", "#76B7B2", "#EDC948",
         "#BAB0AC", "#8CD17D", "#A0CBE8", "#FFBE7D",
     ]
 
     net = Network(height="860px", width="100%", bgcolor="#ffffff", font_color="black", notebook=False, cdn_resources="in_line")
-
-    for n in g.nodes():
+    pos = nx.spring_layout(h2, weight="weight", seed=0, k=0.3)
+    cid_to_color = {}
+    for n in h2.nodes():
         cid = int(part.get(int(n), 0))
-        color = palette[cid % len(palette)]
+        cid_to_color[cid] = palette[cid % len(palette)]
+
+    for n in h2.nodes():
+        cid = int(part.get(int(n), 0))
+        color = cid_to_color[cid]
         name = mol_id_to_name.get(int(n), str(int(n)))
+        # Use plain text tooltip to avoid raw HTML-looking tooltip rendering.
         title = (
-            f"<b>{name}</b><br>"
-            f"Molecule ID: {int(n)}<br>"
-            f"Cluster: {cid+1}<br>"
+            f"{name}\n"
+            f"Flavor profile: {mol_id_to_flavor.get(int(n), '-')}\n"
             f"Weighted degree: {wdeg.get(n, 0.0):.3f}"
         )
         net.add_node(
@@ -467,18 +652,21 @@ def save_moleculespace_html(cuisine: str, g: nx.Graph, part: dict[int, int], mol
             label=name if n in top_nodes else "",
             title=title,
             size=float(size_map[n]),
+            x=float(pos[n][0] * 1400.0),
+            y=float(pos[n][1] * 1400.0),
+            physics=False,
             color={"background": color, "border": "rgba(0,0,0,0)", "highlight": {"background": color, "border": "rgba(0,0,0,0)"}},
             group=str(cid),
         )
 
-    weights = [g[u][v].get("weight", 0.0) for u, v in g.edges()]
+    weights = [h2[u][v].get("weight", 0.0) for u, v in h2.edges()]
     if weights:
         w_min, w_max = min(weights), max(weights)
     else:
         w_min, w_max = 0.0, 1.0
 
-    for u, v in g.edges():
-        w = float(g[u][v].get("weight", 0.0))
+    for u, v in h2.edges():
+        w = float(h2[u][v].get("weight", 0.0))
         width = 0.4 + 3.6 * ((w - w_min) / (w_max - w_min + 1e-12))
         net.add_edge(int(u), int(v), value=w, width=float(width), color="rgba(120,120,120,0.45)")
 
@@ -486,12 +674,7 @@ def save_moleculespace_html(cuisine: str, g: nx.Graph, part: dict[int, int], mol
         """
         const options = {
           "physics": {
-            "solver": "forceAtlas2Based",
-            "forceAtlas2Based": {"gravitationalConstant": -18, "springLength": 110, "damping": 0.92},
-            "minVelocity": 0.02,
-            "maxVelocity": 8,
-            "timestep": 0.18,
-            "stabilization": {"enabled": true, "iterations": 1200, "updateInterval": 50}
+            "enabled": false
           },
           "interaction": {"hover": true, "tooltipDelay": 100},
           "edges": {"smooth": false}
@@ -501,17 +684,22 @@ def save_moleculespace_html(cuisine: str, g: nx.Graph, part: dict[int, int], mol
     net.write_html(str(out_html), notebook=False)
 
     cluster_nodes: dict[int, list[int]] = defaultdict(list)
-    for node, cid in part.items():
-        cluster_nodes[int(cid)].append(int(node))
-    legend_data = [
-        {
-            "cid": int(cid),
-            "label": f"Community {cid}",
-            "color": palette[cid % len(palette)],
-            "keywords": _community_keywords(nodes, mol_id_to_name, top_n=5),
-        }
-        for cid, nodes in sorted(cluster_nodes.items(), key=lambda x: x[0])
-    ]
+    for node in h2.nodes():
+        cid = int(part.get(int(node), 0))
+        cluster_nodes[cid].append(int(node))
+    legend_data = []
+    for cid, nodes in sorted(cluster_nodes.items(), key=lambda x: x[0]):
+        lifts = (cluster_lifts or {}).get(int(cid), [])
+        lift_text = ", ".join([str(ing) for ing, *_ in lifts[:8]])
+        legend_data.append(
+            {
+                "cid": int(cid),
+                "label": f"Community {cid+1}",
+                "color": cid_to_color.get(cid, palette[cid % len(palette)]),
+                "keywords": _community_top_molecules(h2, nodes, mol_id_to_name, top_n=3),
+                "lifts": lift_text,
+            }
+        )
 
     html = out_html.read_text(encoding="utf-8")
     injection = f"""
@@ -520,22 +708,28 @@ def save_moleculespace_html(cuisine: str, g: nx.Graph, part: dict[int, int], mol
 #legend-panel h3 {{ margin: 0 0 6px 0; font-size: 28px; }}
 #legend-panel .sub {{ color:#555; margin-bottom: 12px; }}
 .legend-item {{ display:flex; align-items:flex-start; gap:10px; margin-bottom:10px; cursor:pointer; }}
-.sw {{ width:20px; height:20px; border-radius:4px; margin-top:4px; }}
+.sw {{ width:16px; height:16px; min-width:16px; min-height:16px; border-radius:999px; margin-top:6px; flex:0 0 16px; border:1px solid rgba(0,0,0,0.08); }}
 .item-txt b {{ display:block; font-size: 22px; line-height:1.1; }}
 .item-txt small {{ color:#555; font-size: 16px; line-height:1.2; }}
+.item-txt .lift {{ color:#2f4f4f; margin-top:3px; font-size: 15px; line-height:1.25; }}
 #legend-reset {{ float:right; }}
 </style>
 <div id="legend-panel">
   <button id="legend-reset">Reset</button>
-  <h3>Legend (click to dim others)</h3>
-  <div class="sub">Click a community: selected stays exactly legend color; others dim.</div>
+  <h3>Legend</h3>
+  <div class="sub">Top molecules (3) and top-lift ingredients (8 names).</div>
   <div id="legend-items"></div>
 </div>
 <script>
 const LEGEND_DATA = {json.dumps(legend_data, ensure_ascii=False)};
-const baseNodeColors = new Map();
 const nodesDS = network.body.data.nodes;
-nodesDS.get().forEach(n => baseNodeColors.set(n.id, n.color));
+const edgesDS = network.body.data.edges;
+const baseNodeColors = new Map();
+nodesDS.get().forEach(n => baseNodeColors.set(n.id, n.color || null));
+const baseEdgeStyle = new Map();
+edgesDS.get().forEach(e => baseEdgeStyle.set(e.id, {{color:e.color, width:e.width}}));
+const communityColor = new Map();
+LEGEND_DATA.forEach(r => communityColor.set(String(r.cid), r.color || '#999'));
 
 function resetLegend() {{
   const updates = [];
@@ -543,33 +737,64 @@ function resetLegend() {{
     updates.push({{id:n.id, color:baseNodeColors.get(n.id), opacity:1, font:{{color:'#222'}}}});
   }});
   nodesDS.update(updates);
+  const eUpdates = [];
+  edgesDS.get().forEach(e => {{
+    const base = baseEdgeStyle.get(e.id) || {{}};
+    eUpdates.push({{id:e.id, color:base.color, width:base.width}});
+  }});
+  edgesDS.update(eUpdates);
 }}
 
-function selectCommunity(cid, color) {{
+function selectCommunity(cid) {{
+  const selColor = communityColor.get(String(cid)) || '#999';
   const updates = [];
   nodesDS.get().forEach(n => {{
     if (String(n.group) === String(cid)) {{
-      updates.push({{id:n.id, color:{{background:color,border:'rgba(0,0,0,0)',highlight:{{background:color,border:'rgba(0,0,0,0)'}}}}, opacity:1, font:{{color:'#111'}}}});
+      updates.push({{
+        id:n.id,
+        color:{{background:selColor,border:'rgba(0,0,0,0)',highlight:{{background:selColor,border:'rgba(0,0,0,0)'}}}},
+        opacity:1,
+        font:{{color:'#111'}}
+      }});
     }} else {{
-      updates.push({{id:n.id, color:'rgba(210,210,210,0.24)', opacity:0.18, font:{{color:'rgba(120,120,120,0.3)'}}}});
+      updates.push({{
+        id:n.id,
+        color:'rgba(250,250,250,0.08)',
+        opacity:0.03,
+        font:{{color:'rgba(210,210,210,0.18)'}}
+      }});
     }}
   }});
   nodesDS.update(updates);
+
+  const nodeGroup = new Map();
+  nodesDS.get().forEach(n => nodeGroup.set(n.id, String(n.group)));
+  const eUpdates = [];
+  edgesDS.get().forEach(e => {{
+    const g1 = nodeGroup.get(e.from);
+    const g2 = nodeGroup.get(e.to);
+    const base = baseEdgeStyle.get(e.id) || {{}};
+    if (g1 === String(cid) && g2 === String(cid)) {{
+      eUpdates.push({{id:e.id, color:base.color, width:base.width}});
+    }} else {{
+      eUpdates.push({{id:e.id, color:'rgba(252,252,252,0.06)', width:0.2}});
+    }}
+  }});
+  edgesDS.update(eUpdates);
 }}
 
 const itemsHost = document.getElementById('legend-items');
-LEGEND_DATA.forEach(row => {{
-  const item = document.createElement('div');
-  item.className = 'legend-item';
-  item.innerHTML = `<div class="sw" style="background:${{row.color}}"></div><div class="item-txt"><b>${{row.label}}</b><small>${{row.keywords || ''}}</small></div>`;
-  item.onclick = () => selectCommunity(row.cid, row.color);
-  itemsHost.appendChild(item);
-}});
+if (itemsHost) {{
+  LEGEND_DATA.forEach(row => {{
+    const swColor = row.color || '#999';
+    const item = document.createElement('div');
+    item.className = 'legend-item';
+    item.innerHTML = `<div class="sw" style="background:${{swColor}}"></div><div class="item-txt"><b>${{row.label}}</b><small>${{row.keywords || ''}}</small><div class="lift">${{row.lifts || ''}}</div></div>`;
+    item.onclick = () => selectCommunity(row.cid);
+    itemsHost.appendChild(item);
+  }});
+}}
 document.getElementById('legend-reset').onclick = resetLegend;
-
-network.once('stabilizationIterationsDone', function() {{
-  network.setOptions({{physics: {{enabled: false}}}});
-}});
 </script>
 """
     if "</body>" in html:
@@ -579,7 +804,18 @@ network.once('stabilizationIterationsDone', function() {{
     out_html.write_text(html, encoding="utf-8")
 
 
-def plot_cuisine_summary(cuisine: str, rids: list[int], p_by_r: dict, rid2ings: dict, mol_id_to_name: dict[int, str], out_dir: Path, top_k_clusters: int, df_rate_ban_threshold: float, verbose_ban: bool) -> dict | None:
+def plot_cuisine_summary(
+    cuisine: str,
+    rids: list[int],
+    p_by_r: dict,
+    rid2ings: dict,
+    mol_id_to_name: dict[int, str],
+    mol_id_to_flavor: dict[int, str],
+    out_dir: Path,
+    top_k_clusters: int,
+    df_rate_ban_threshold: float,
+    verbose_ban: bool,
+) -> dict | None:
     n, count_m, count_mm = cooc_counts_from_recipes(rids, p_by_r, rho=0.9, max_keep=200)
     if n == 0:
         print(f"[{cuisine}] no usable recipes")
@@ -642,13 +878,17 @@ def plot_cuisine_summary(cuisine: str, rids: list[int], p_by_r: dict, rid2ings: 
         )
 
     panels = [axes[0, 1], axes[0, 2], axes[1, 0], axes[1, 1], axes[1, 2]]
+    cluster_lifts: dict[int, list[tuple[str, float, float, float, int]]] = {}
+    for cid in top_ids:
+        cluster_lifts[int(cid)] = ingredient_lift_for_cluster_soft(rids, rid2w, int(cid), rid2ings, min_df=5)
+
     for ax, cid in zip(panels, top_ids):
         wc = make_wordcloud(node_weights(clusters[cid], p_m, mol_id_to_name))
         ax.set_title(f"Cluster {cid+1}")
         ax.axis("off")
         if wc is not None:
             ax.imshow(wc)
-        lifts = ingredient_lift_for_cluster_soft(rids, rid2w, cid, rid2ings, min_df=5)
+        lifts = cluster_lifts.get(int(cid), [])
         txt = "\n".join([f"{i+1}. {ing} (lift={lift:.2f})" for i, (ing, lift, *_rest) in enumerate(lifts[:12])])
         if not txt:
             txt = "(ingredient lift unavailable)"
@@ -662,11 +902,19 @@ def plot_cuisine_summary(cuisine: str, rids: list[int], p_by_r: dict, rid2ings: 
     plt.close(fig)
 
     save_moleculespace_plot(cuisine, g, part, mol_id_to_name, out_dir / f"{safe_key(cuisine)}_moleculespace_graph.png")
-    save_moleculespace_html(cuisine, g, part, mol_id_to_name, out_dir / f"{safe_key(cuisine)}_moleculespace_graph.html")
+    save_moleculespace_html(
+        cuisine,
+        g,
+        part,
+        mol_id_to_name,
+        mol_id_to_flavor,
+        out_dir / f"{safe_key(cuisine)}_moleculespace_graph.html",
+        cluster_lifts=cluster_lifts,
+    )
 
     rows = [{"cluster_id": i + 1, "soft_mass": float(soft[i]), "molecule_count": len(nodes)} for i, nodes in enumerate(clusters)]
     pd.DataFrame(rows).sort_values("soft_mass", ascending=False).to_csv(
-        (ANALYSIS_ROOT / safe_key(cuisine) / "000_cluster_summary.csv"), index=False
+        (ANALYSIS_ROOT / f"{safe_key(cuisine)}_cluster_summary.csv"), index=False
     )
 
     return {"N_used": n, "cluster_count": len(clusters), "graph_nodes": g.number_of_nodes(), "graph_edges": g.number_of_edges()}
@@ -674,7 +922,7 @@ def plot_cuisine_summary(cuisine: str, rids: list[int], p_by_r: dict, rid2ings: 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Cuisine-only cluster summary plot generator")
-    parser.add_argument("--cuisines", nargs="*", default=["Japanese"])
+    parser.add_argument("--cuisines", nargs="*", default=None)
     parser.add_argument("--top-k-clusters", type=int, default=5)
     parser.add_argument("--all-cuisines", action="store_true")
     parser.add_argument("--df-rate-ban-threshold", type=float, default=0.75)
@@ -686,17 +934,25 @@ def main() -> None:
     args = parse_args()
     p_by_r, rid2cuisine, rid2ings = load_saved_state()
     mol_id_to_name = load_molecule_names()
+    mol_id_to_flavor = load_molecule_flavor_profiles()
 
-    if args.all_cuisines and rid2cuisine:
-        cuisines = sorted({str(c) for c in rid2cuisine.values()})
-    else:
+    if args.all_cuisines:
+        if rid2cuisine:
+            cuisines = sorted({str(c) for c in rid2cuisine.values()})
+        else:
+            cuisines = list_graph_cuisines() or list_cuisines_from_normalized_csv()
+    elif args.cuisines:
         cuisines = args.cuisines
+    else:
+        cuisines = list_graph_cuisines() or (sorted({str(c) for c in rid2cuisine.values()}) if rid2cuisine else [])
+
+    if not cuisines:
+        print("No cuisines resolved. Use --cuisines ... or run generate pipeline first.")
+        return
 
     for cuisine in cuisines:
         out_plot_dir = PLOTS_ROOT / safe_key(cuisine)
-        out_analysis_dir = ANALYSIS_ROOT / safe_key(cuisine)
         out_plot_dir.mkdir(parents=True, exist_ok=True)
-        out_analysis_dir.mkdir(parents=True, exist_ok=True)
 
         if p_by_r and rid2cuisine:
             rids = [int(rid) for rid, c in rid2cuisine.items() if str(c) == cuisine]
@@ -705,7 +961,17 @@ def main() -> None:
         else:
             p_source, rids, rid2ings_source = load_from_graph_csv(cuisine)
 
+        rid_set = set(int(r) for r in rids)
+        missing_rids = {rid for rid in rid_set if not rid2ings_source.get(rid)}
+        if missing_rids:
+            supplement = load_rid2ings_from_normalized_csv(cuisine=cuisine, restrict_rids=missing_rids)
+            if supplement:
+                for rid, ings in supplement.items():
+                    rid2ings_source.setdefault(rid, set()).update(ings)
+                print(f"[{cuisine}] ingredient fallback from recipes_long_normalized.csv: +{len(supplement)} recipes")
+
         mol_id_to_name = enrich_molecule_names_from_edges(mol_id_to_name, cuisine)
+        mol_id_to_flavor = enrich_molecule_flavor_from_edges(mol_id_to_flavor, cuisine)
 
         print(f"\n=== {cuisine} ===")
         print(f"recipes: {len(rids)}")
@@ -715,6 +981,7 @@ def main() -> None:
             p_by_r=p_source,
             rid2ings=rid2ings_source,
             mol_id_to_name=mol_id_to_name,
+            mol_id_to_flavor=mol_id_to_flavor,
             out_dir=out_plot_dir,
             top_k_clusters=args.top_k_clusters,
             df_rate_ban_threshold=args.df_rate_ban_threshold,
