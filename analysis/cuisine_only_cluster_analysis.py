@@ -17,6 +17,7 @@ Fallback input:
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import pickle
 import re
@@ -106,10 +107,33 @@ def load_saved_state() -> tuple[dict, dict, dict]:
     return p_by_r, rid2cuisine, rid2ings
 
 
-def load_from_graph_csv(cuisine: str) -> tuple[dict, list[int]]:
+def _extract_rid2ings_from_df(df: pd.DataFrame) -> dict[int, set[str]]:
+    rid_col = _pick_col(df, ["recipe_id", "rid", "recipeid"])
+    ing_col = _pick_col(
+        df,
+        [
+            "ingredient",
+            "ingredients",
+            "ingredient_name",
+            "ingredient_name_en",
+            "ing",
+            "ingredient_clean",
+        ],
+    )
+    rid2ings: dict[int, set[str]] = defaultdict(set)
+    if rid_col is None or ing_col is None:
+        return rid2ings
+    for rid, ing in df[[rid_col, ing_col]].dropna().itertuples(index=False):
+        sval = str(ing).strip()
+        if sval:
+            rid2ings[int(rid)].add(sval)
+    return rid2ings
+
+
+def load_from_graph_csv(cuisine: str) -> tuple[dict, list[int], dict[int, set[str]]]:
     csv_path = GRAPH_ROOT / cuisine / "000_recipe_molecule_edges.csv"
     if not csv_path.exists():
-        return {}, []
+        return {}, [], {}
     df = pd.read_csv(csv_path)
     required = {"recipe_id", "molecule", "p"}
     if not required.issubset(df.columns):
@@ -117,7 +141,8 @@ def load_from_graph_csv(cuisine: str) -> tuple[dict, list[int]]:
     p_by_r: dict[int, dict[int, float]] = defaultdict(dict)
     for rid, mol, p in df[["recipe_id", "molecule", "p"]].itertuples(index=False):
         p_by_r[int(rid)][int(mol)] = float(p)
-    return p_by_r, sorted(p_by_r.keys())
+    rid2ings = _extract_rid2ings_from_df(df)
+    return p_by_r, sorted(p_by_r.keys()), rid2ings
 
 
 def enrich_molecule_names_from_edges(mol_id_to_name: Dict[int, str], cuisine: str) -> Dict[int, str]:
@@ -356,6 +381,21 @@ def _parse_flavor_tokens(s: str) -> list[str]:
     return [t for t in toks if t]
 
 
+def _community_keywords(cluster_nodes: list[int], mol_id_to_name: dict[int, str], top_n: int = 5) -> str:
+    ban = {
+        "acid", "methyl", "ethyl", "propyl", "isopropyl", "d", "l", "dl", "cis", "trans",
+        "alpha", "beta", "gamma", "oxide", "one", "ol", "ene", "ate", "yl", "di", "tri",
+    }
+    cnt: Counter = Counter()
+    for m in cluster_nodes:
+        name = mol_id_to_name.get(int(m), "")
+        if not name:
+            continue
+        toks = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z\-]{2,}", name)]
+        cnt.update(t for t in toks if t not in ban)
+    return ", ".join([w for w, _ in cnt.most_common(top_n)])
+
+
 def save_moleculespace_html(cuisine: str, g: nx.Graph, part: dict[int, int], mol_id_to_name: dict[int, str], out_html: Path) -> None:
     """Interactive molecule-space HTML similar to vocab_alignment notebook style."""
     if Network is None or g.number_of_nodes() == 0:
@@ -405,13 +445,98 @@ def save_moleculespace_html(cuisine: str, g: nx.Graph, part: dict[int, int], mol
     net.set_options(
         """
         const options = {
-          "physics": {"solver": "forceAtlas2Based", "forceAtlas2Based": {"gravitationalConstant": -25, "springLength": 95}, "minVelocity": 0.75},
+          "physics": {
+            "solver": "forceAtlas2Based",
+            "forceAtlas2Based": {"gravitationalConstant": -18, "springLength": 110, "damping": 0.92},
+            "minVelocity": 0.02,
+            "maxVelocity": 8,
+            "timestep": 0.18,
+            "stabilization": {"enabled": true, "iterations": 1200, "updateInterval": 50}
+          },
           "interaction": {"hover": true, "tooltipDelay": 100},
           "edges": {"smooth": false}
         }
         """
     )
     net.write_html(str(out_html), notebook=False)
+
+    cluster_nodes: dict[int, list[int]] = defaultdict(list)
+    for node, cid in part.items():
+        cluster_nodes[int(cid)].append(int(node))
+    legend_data = [
+        {
+            "cid": int(cid),
+            "label": f"Community {cid}",
+            "color": palette[cid % len(palette)],
+            "keywords": _community_keywords(nodes, mol_id_to_name, top_n=5),
+        }
+        for cid, nodes in sorted(cluster_nodes.items(), key=lambda x: x[0])
+    ]
+
+    html = out_html.read_text(encoding="utf-8")
+    injection = f"""
+<style>
+#legend-panel {{ position: fixed; right: 18px; top: 18px; width: 360px; max-height: 78vh; overflow: auto; background: rgba(245,245,245,0.95); border-radius: 14px; border: 1px solid #d0d0d0; padding: 14px; font-family: Arial, sans-serif; z-index: 9999; }}
+#legend-panel h3 {{ margin: 0 0 6px 0; font-size: 28px; }}
+#legend-panel .sub {{ color:#555; margin-bottom: 12px; }}
+.legend-item {{ display:flex; align-items:flex-start; gap:10px; margin-bottom:10px; cursor:pointer; }}
+.sw {{ width:20px; height:20px; border-radius:4px; margin-top:4px; }}
+.item-txt b {{ display:block; font-size: 22px; line-height:1.1; }}
+.item-txt small {{ color:#555; font-size: 16px; line-height:1.2; }}
+#legend-reset {{ float:right; }}
+</style>
+<div id="legend-panel">
+  <button id="legend-reset">Reset</button>
+  <h3>Legend (click to dim others)</h3>
+  <div class="sub">Click a community: selected stays exactly legend color; others dim.</div>
+  <div id="legend-items"></div>
+</div>
+<script>
+const LEGEND_DATA = {json.dumps(legend_data, ensure_ascii=False)};
+const baseNodeColors = new Map();
+const nodesDS = network.body.data.nodes;
+nodesDS.get().forEach(n => baseNodeColors.set(n.id, n.color));
+
+function resetLegend() {{
+  const updates = [];
+  nodesDS.get().forEach(n => {{
+    updates.push({{id:n.id, color:baseNodeColors.get(n.id), opacity:1, font:{{color:'#222'}}}});
+  }});
+  nodesDS.update(updates);
+}}
+
+function selectCommunity(cid, color) {{
+  const updates = [];
+  nodesDS.get().forEach(n => {{
+    if (String(n.group) === String(cid)) {{
+      updates.push({{id:n.id, color:{{background:color,border:'rgba(0,0,0,0)',highlight:{{background:color,border:'rgba(0,0,0,0)'}}}}, opacity:1, font:{{color:'#111'}}}});
+    }} else {{
+      updates.push({{id:n.id, color:'rgba(210,210,210,0.24)', opacity:0.18, font:{{color:'rgba(120,120,120,0.3)'}}}});
+    }}
+  }});
+  nodesDS.update(updates);
+}}
+
+const itemsHost = document.getElementById('legend-items');
+LEGEND_DATA.forEach(row => {{
+  const item = document.createElement('div');
+  item.className = 'legend-item';
+  item.innerHTML = `<div class="sw" style="background:${{row.color}}"></div><div class="item-txt"><b>${{row.label}}</b><small>${{row.keywords || ''}}</small></div>`;
+  item.onclick = () => selectCommunity(row.cid, row.color);
+  itemsHost.appendChild(item);
+}});
+document.getElementById('legend-reset').onclick = resetLegend;
+
+network.once('stabilizationIterationsDone', function() {{
+  network.setOptions({{physics: {{enabled: false}}}});
+}});
+</script>
+"""
+    if "</body>" in html:
+        html = html.replace("</body>", injection + "\n</body>")
+    else:
+        html += injection
+    out_html.write_text(html, encoding="utf-8")
 
 
 def plot_cuisine_summary(cuisine: str, rids: list[int], p_by_r: dict, rid2ings: dict, mol_id_to_name: dict[int, str], out_dir: Path, top_k_clusters: int, df_rate_ban_threshold: float, verbose_ban: bool) -> dict | None:
@@ -536,8 +661,9 @@ def main() -> None:
         if p_by_r and rid2cuisine:
             rids = [int(rid) for rid, c in rid2cuisine.items() if str(c) == cuisine]
             p_source = p_by_r
+            rid2ings_source = rid2ings
         else:
-            p_source, rids = load_from_graph_csv(cuisine)
+            p_source, rids, rid2ings_source = load_from_graph_csv(cuisine)
 
         mol_id_to_name = enrich_molecule_names_from_edges(mol_id_to_name, cuisine)
 
@@ -547,7 +673,7 @@ def main() -> None:
             cuisine=cuisine,
             rids=rids,
             p_by_r=p_source,
-            rid2ings=rid2ings,
+            rid2ings=rid2ings_source,
             mol_id_to_name=mol_id_to_name,
             out_dir=out_plot_dir,
             top_k_clusters=args.top_k_clusters,
