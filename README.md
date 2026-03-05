@@ -1,80 +1,112 @@
 # CompoundAnalysis
 
-## Pipeline Overview
-Recommended flow:
-1. `generate/generate.py` (or `generate/generate.ipynb`)
-2. `analysis/cuisine_only_cluster_analysis.py`
+`CompoundAnalysis`는 레시피-분자 연결 데이터를 생성하고(`generate`), cuisine별 분자 클러스터 분석/시각화를 수행하는(`analysis`) 파이프라인입니다.
 
-`generate` builds cuisine-wise molecule graph inputs.
-`analysis` consumes those outputs and produces summary plots + cluster tables.
+## 폴더 구조
+- `generate/generate.py`: cuisine별 그래프 입력 CSV 생성
+- `analysis/cuisine_only_cluster_analysis.py`: cuisine별 클러스터 분석 + 시각화
+- `preprocess/`: 전처리 파일
+- `result/`: 생성 결과 저장 경로
+
+## 실행 환경
+- Python 3.10+ 권장
+
+## 패키지 설치
+프로젝트 루트(`CompoundAnalysis`)에서 실행:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+## 파이프라인 실행 순서
+1. `generate/generate.py` 실행
+2. `analysis/cuisine_only_cluster_analysis.py` 실행
+
+---
 
 ## 1) Generate Stage
-### Script
+### 스크립트
 - `generate/generate.py`
 
-### Main outputs
+### 주요 출력
 - `result/recipes_long_normalized.csv`
 - `result/graph/recipe_molecule_edges.csv`
 - `result/graph/recipe_unk_mass.csv`
 - `result/graph/<cuisine>/000_recipe_molecule_edges.csv`
 - `result/graph/<cuisine>/001_molecule_weight.csv`
 - `result/graph/<cuisine>/002_molecule_recipe_edges.csv`
-- `result/graph/ALL/*` (when ALL export is enabled)
+- `result/graph/ALL/*` (`ALL` export 활성 시)
 - `result/analysis/analysis_summary.csv`
 
-### Cuisine behavior
-- If `--cuisines` is omitted: exports all cuisines + `ALL` (full dataset aggregate)
-- If `--cuisines` is provided: exports only those cuisines
-- Add `--include-all` to also export `ALL` with selected cuisines
+### cuisine 동작
+- `--cuisines` 생략: 전체 cuisine + `ALL` 생성
+- `--cuisines` 지정: 지정 cuisine만 생성
+- `--include-all`: 지정 cuisine + `ALL` 함께 생성
 
-### Run examples
-All cuisines + ALL:
+### 실행 예시
+전체 cuisine + ALL:
 ```bash
 python generate/generate.py
 ```
 
-Selected cuisines only:
+특정 cuisine만:
 ```bash
 python generate/generate.py --cuisines Korean Thai
 ```
 
-Selected cuisines + ALL:
+특정 cuisine + ALL:
 ```bash
 python generate/generate.py --cuisines Korean Thai --include-all
 ```
 
-Optional cluster overview PNGs:
+(선택) 클러스터 개요 플롯까지 생성:
 ```bash
 python generate/generate.py --export-cluster-overview-plots
 ```
 
+---
+
 ## 2) Analysis Stage
-### Script
+### 스크립트
 - `analysis/cuisine_only_cluster_analysis.py`
 
-### Input priority
-1. `saved_state/*` (if present)
+### 입력 우선순위
+1. `saved_state/*` (있으면 우선 사용)
 2. `result/graph/<cuisine>/000_recipe_molecule_edges.csv`
-3. Ingredient fallback from `result/recipes_long_normalized.csv`
+3. `result/recipes_long_normalized.csv`의 ingredient fallback
 
-### Main outputs
+### 주요 출력
 - `result/plots/<cuisine>/<cuisine>_summary.png`
 - `result/plots/<cuisine>/<cuisine>_moleculespace_graph.png`
 - `result/plots/<cuisine>/<cuisine>_moleculespace_graph.html`
 - `result/analysis/<cuisine>/000_cluster_summary.csv`
 
-### Run examples
-Auto-detect cuisines from `result/graph`:
+### 실행 예시
+`result/graph`에서 cuisine 자동 탐색:
 ```bash
 python analysis/cuisine_only_cluster_analysis.py
 ```
 
-Specific cuisines:
+특정 cuisine 분석:
 ```bash
 python analysis/cuisine_only_cluster_analysis.py --cuisines Korean Thai
 ```
 
-All cuisines:
+전체 cuisine 분석:
 ```bash
 python analysis/cuisine_only_cluster_analysis.py --all-cuisines
+```
+
+## 빠른 시작 (복사해서 실행)
+```bash
+cd CompoundAnalysis
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
+python generate/generate.py
+python analysis/cuisine_only_cluster_analysis.py
 ```
